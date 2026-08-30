@@ -85,6 +85,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
@@ -364,21 +365,78 @@ final class R2DBC {
         }
     }
 
-    private static final class CancellableConnection extends AtomicReference<Object> {
-        private static final Object CANCELLED = new Object();
+    private static final class CancellableConnection {
+        private static final int EMPTY = 0;
+        private static final int STARTING = 1;
+        private static final int ACTIVE = 2;
+        private static final int TERMINATION_PENDING = 3;
+        private static final int TERMINATED = 4;
 
-        final boolean setConnection(Connection c) {
-            return compareAndSet(null, c);
+        private static final AtomicIntegerFieldUpdater<CancellableConnection> STATE =
+            AtomicIntegerFieldUpdater.newUpdater(CancellableConnection.class, "state");
+
+        private volatile int                  state;
+        private volatile Connection           connection;
+        private volatile Consumer<Connection> termination;
+
+        final boolean start(Connection c) {
+            if (!STATE.compareAndSet(this, EMPTY, STARTING))
+                return false;
+
+            connection = c;
+            return true;
         }
 
-        final Connection cancel() {
-            Object c = getAndSet(CANCELLED);
-            return c instanceof Connection connection ? connection : null;
+        final void started() {
+            if (STATE.compareAndSet(this, STARTING, ACTIVE))
+                return;
+
+            if (STATE.compareAndSet(this, TERMINATION_PENDING, TERMINATED)) {
+                Consumer<Connection> action = termination;
+                Connection c = connection;
+                termination = null;
+                connection = null;
+                action.accept(c);
+            }
+        }
+
+        final void terminate(Consumer<Connection> action, Runnable ifEmpty) {
+            for (;;) {
+                switch (state) {
+                    case EMPTY:
+                        if (STATE.compareAndSet(this, EMPTY, TERMINATED)) {
+                            ifEmpty.run();
+                            return;
+                        }
+
+                        break;
+                    case STARTING:
+                        termination = action;
+                        if (STATE.compareAndSet(this, STARTING, TERMINATION_PENDING))
+                            return;
+
+                        break;
+                    case ACTIVE:
+                        if (STATE.compareAndSet(this, ACTIVE, TERMINATED)) {
+                            Connection c = connection;
+                            termination = null;
+                            connection = null;
+                            action.accept(c);
+                            return;
+                        }
+
+                        break;
+                    case TERMINATION_PENDING:
+                    case TERMINATED:
+                        return;
+                    default:
+                        throw new IllegalStateException("Unsupported connection state: " + state);
+                }
+            }
         }
 
         final Connection connection() {
-            Object c = get();
-            return c instanceof Connection connection ? connection : null;
+            return connection;
         }
     }
 
@@ -577,8 +635,14 @@ final class R2DBC {
 
         @Override
         public final void onNext(Connection c) {
-            if (connection.setConnection(c))
-                onNext0(c);
+            if (connection.start(c)) {
+                try {
+                    onNext0(c);
+                }
+                finally {
+                    connection.started();
+                }
+            }
             else
                 closeLateConnection(c);
         }
@@ -606,7 +670,9 @@ final class R2DBC {
 
         @Override
         public final void onError(Throwable t) {
-            downstream.subscriber.onError(translate(downstream.configuration.dsl(), downstream.sql(), t));
+            downstream.complete(() -> downstream.subscriber.onError(
+                translate(downstream.configuration.dsl(), downstream.sql(), t)
+            ));
         }
 
         @Override
@@ -680,7 +746,6 @@ final class R2DBC {
 
             // [#13343] Cancel the downstream in case of a rendering bug in jOOQ
             catch (Throwable t) {
-                downstream.cancel();
                 onError(t);
             }
         }
@@ -730,7 +795,6 @@ final class R2DBC {
 
             // [#13343] Cancel the downstream in case of a rendering bug in jOOQ
             catch (Throwable t) {
-                downstream.cancel();
                 onError(t);
             }
         }
@@ -784,7 +848,6 @@ final class R2DBC {
 
             // [#13343] Cancel the downstream in case of a rendering bug in jOOQ
             catch (Throwable t) {
-                downstream.cancel();
                 onError(t);
             }
         }
@@ -882,24 +945,29 @@ final class R2DBC {
                 return;
             }
 
-            Connection c = delegate().connection.cancel();
-
-            if (
-                c == null
-
-                // [#13802] Skip attempting to unnecessarily close NonClosingConnection
-                || c instanceof NonClosingConnection
-            )
-                onComplete.run();
-            else
-                c.close().subscribe(subscriber(
-                    s -> s.request(Long.MAX_VALUE),
-                    t -> {},
-                    t -> {},
-                    onComplete,
-                    configuration.subscriberProvider(),
-                    subscriber
-                ));
+            delegate().connection.terminate(c -> {
+                if (c instanceof NonClosingConnection)
+                    onComplete.run();
+                else {
+                    try {
+                        c.close().subscribe(subscriber(
+                            s -> s.request(Long.MAX_VALUE),
+                            t -> {},
+                            t -> {
+                                log.warn("Error while closing an R2DBC connection", t);
+                                onComplete.run();
+                            },
+                            onComplete,
+                            configuration.subscriberProvider(),
+                            subscriber
+                        ));
+                    }
+                    catch (Throwable closeError) {
+                        log.warn("Error while closing an R2DBC connection", closeError);
+                        onComplete.run();
+                    }
+                }
+            }, onComplete);
         }
 
         abstract ConnectionSubscriber<T> delegate();
@@ -1206,28 +1274,28 @@ final class R2DBC {
             for (Forwarding<T> forwarder : forwarders.values())
                 forwarder.subscription.cancel();
 
-            Connection c = delegate.connection.cancel();
+            delegate.connection.terminate(c -> {
+                if (c instanceof NonClosingConnection) {
+                    signalFinish(signal, error);
+                    return;
+                }
 
-            if (c == null || c instanceof NonClosingConnection) {
-                signalFinish(signal, error);
-                return;
-            }
+                FinishOnClose closeComplete = new FinishOnClose(signal, error);
 
-            FinishOnClose closeComplete = new FinishOnClose(signal, error);
-
-            try {
-                c.close().subscribe(subscriber(
-                    s -> s.request(Long.MAX_VALUE),
-                    v -> {},
-                    closeComplete,
-                    closeComplete,
-                    configuration.subscriberProvider(),
-                    subscriber
-                ));
-            }
-            catch (Throwable closeError) {
-                closeComplete.accept(closeError);
-            }
+                try {
+                    c.close().subscribe(subscriber(
+                        s -> s.request(Long.MAX_VALUE),
+                        v -> {},
+                        closeComplete,
+                        closeComplete,
+                        configuration.subscriberProvider(),
+                        subscriber
+                    ));
+                }
+                catch (Throwable closeError) {
+                    closeComplete.accept(closeError);
+                }
+            }, () -> signalFinish(signal, error));
         }
 
         private final void signalFinish(boolean signal, Throwable error) {
