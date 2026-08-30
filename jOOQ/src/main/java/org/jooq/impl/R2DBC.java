@@ -79,6 +79,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -267,12 +268,12 @@ final class R2DBC {
 
         final int                           forwarderIndex;
         final AbstractResultSubscriber<T>   resultSubscriber;
-        final AtomicReference<Subscription> subscription;
+        final CancellableSubscription       subscription;
 
         Forwarding(int forwarderIndex, AbstractResultSubscriber<T> resultSubscriber) {
             this.forwarderIndex = forwarderIndex;
             this.resultSubscriber = resultSubscriber;
-            this.subscription = new AtomicReference<>();
+            this.subscription = new CancellableSubscription();
         }
 
         @Override
@@ -282,15 +283,27 @@ final class R2DBC {
 
         @Override
         public final void onSubscribe(Subscription s) {
-            subscription.set(s);
-            resultSubscriber.downstream.request2(s);
+            if (!subscription.setSubscription(s)) {
+                complete(true, () -> {});
+                return;
+            }
+
+            // [#20112] A result may arrive after downstream cancellation. In
+            //          that case, cancel the late row subscription instead of
+            //          leaving it subscribed without demand.
+            if (resultSubscriber.downstream.completed.get()) {
+                complete(true, () -> {});
+                subscription.cancel();
+            }
+            else
+                resultSubscriber.downstream.request2(subscription);
         }
 
         @Override
         public final void onNext(T value) {
             if (!resultSubscriber.downstream.completed.get()) {
                 resultSubscriber.downstream.subscriber.onNext(value);
-                resultSubscriber.downstream.request2(subscription.get());
+                resultSubscriber.downstream.request2(subscription);
             }
         }
 
@@ -310,6 +323,62 @@ final class R2DBC {
             // [#13343] [#13669] Prevent premature completion
             if (resultSubscriber.downstream.forwarders.isEmpty() && (cancelled || resultSubscriber.completionRequested.get()))
                 resultSubscriber.complete(cancelled, onComplete);
+        }
+    }
+
+    private static final class CancellableSubscription extends AtomicReference<Subscription> {
+
+        private static final Subscription CANCELLED = new Subscription() {
+            @Override
+            public final void request(long n) {}
+
+            @Override
+            public final void cancel() {}
+        };
+
+        final boolean setSubscription(Subscription s) {
+            if (compareAndSet(null, s))
+                return true;
+
+            s.cancel();
+            return false;
+        }
+
+        final void cancel() {
+            Subscription s = getAndSet(CANCELLED);
+
+            if (s != null && s != CANCELLED)
+                s.cancel();
+        }
+
+        final void request(long n) {
+            Subscription s = get();
+
+            if (s != null && s != CANCELLED)
+                s.request(n);
+        }
+
+        final Subscription subscription() {
+            Subscription s = get();
+            return s != CANCELLED ? s : null;
+        }
+    }
+
+    private static final class CancellableConnection extends AtomicReference<Object> {
+        private static final Object CANCELLED = new Object();
+
+        final boolean setConnection(Connection c) {
+            return compareAndSet(null, c);
+        }
+
+        final Connection cancel() {
+            Object c = getAndSet(CANCELLED);
+            return c instanceof Connection connection ? connection : null;
+        }
+
+        final Connection connection() {
+            Object c = get();
+            return c instanceof Connection connection ? connection : null;
         }
     }
 
@@ -337,7 +406,8 @@ final class R2DBC {
 
         @Override
         public final void onSubscribe(Subscription s) {
-            s.request(Long.MAX_VALUE);
+            if (downstream.executionSubscription.setSubscription(s))
+                downstream.executionSubscription.request(Long.MAX_VALUE);
         }
 
         @Override
@@ -477,13 +547,13 @@ final class R2DBC {
     static abstract class ConnectionSubscriber<T> implements DownstreamSubscriber<Connection> {
 
         final AbstractNonBlockingSubscription<T> downstream;
-        final AtomicReference<Connection>        connection;
-        final AtomicReference<Subscription>      subscription;
+        final CancellableConnection              connection;
+        final CancellableSubscription            subscription;
 
         ConnectionSubscriber(AbstractNonBlockingSubscription<T> downstream) {
             this.downstream = downstream;
-            this.connection = new AtomicReference<>();
-            this.subscription = new AtomicReference<>();
+            this.connection = new CancellableConnection();
+            this.subscription = new CancellableSubscription();
         }
 
         @Override
@@ -494,15 +564,42 @@ final class R2DBC {
         @Override
         public final void onSubscribe(Subscription s) {
 
-            // [#17094] Stores the Subscription that handles the connection establishment.
-            subscription.set(s);
-            s.request(1);
+            // [#17094] Store the subscription that handles connection
+            //          establishment. The cancellation sentinel also catches
+            //          an onSubscribe signal that races with cancellation.
+            if (subscription.setSubscription(s)) {
+                if (downstream.completed.get())
+                    subscription.cancel();
+                else
+                    subscription.request(1);
+            }
         }
 
         @Override
         public final void onNext(Connection c) {
-            connection.set(c);
-            onNext0(c);
+            if (connection.setConnection(c))
+                onNext0(c);
+            else
+                closeLateConnection(c);
+        }
+
+        private final void closeLateConnection(Connection c) {
+            if (c instanceof NonClosingConnection)
+                return;
+
+            try {
+                c.close().subscribe(subscriber(
+                    s -> s.request(Long.MAX_VALUE),
+                    v -> {},
+                    t -> log.warn("Error while closing a connection delivered after cancellation", t),
+                    () -> {},
+                    downstream.configuration.subscriberProvider(),
+                    downstream.subscriber
+                ));
+            }
+            catch (Throwable t) {
+                log.warn("Error while closing a connection delivered after cancellation", t);
+            }
         }
 
         abstract void onNext0(Connection c);
@@ -516,12 +613,7 @@ final class R2DBC {
         public final void onComplete() {}
 
         final void cancelSubscription() {
-            subscription.updateAndGet(s -> {
-                if (s != null)
-                    s.cancel();
-
-                return null;
-            });
+            subscription.cancel();
         }
     }
 
@@ -702,6 +794,7 @@ final class R2DBC {
 
         final AtomicBoolean                         subscribed;
         final Publisher<? extends Connection>       connection;
+        final CancellableSubscription               executionSubscription;
         final AtomicInteger                         nextForwarderIndex;
         final ConcurrentMap<Integer, Forwarding<T>> forwarders;
 
@@ -713,6 +806,7 @@ final class R2DBC {
 
             this.subscribed = new AtomicBoolean();
             this.connection = configuration.connectionFactory().create();
+            this.executionSubscription = new CancellableSubscription();
             this.nextForwarderIndex = new AtomicInteger();
             this.forwarders = new ConcurrentHashMap<>();
         }
@@ -742,23 +836,22 @@ final class R2DBC {
                 request1();
         }
 
-        private final void forAllForwardingSubscriptions(Consumer<? super Subscription> consumer) {
+        private final void forAllForwardingSubscriptions(Consumer<? super CancellableSubscription> consumer) {
 
             // Forwarders all forward to the same downstream and are not
             // expected to be contained in the map at the same time.
-            for (Forwarding<T> f : forwarders.values()) {
-                Subscription s = f.subscription.get();
-
-                if (s != null)
-                    consumer.accept(s);
-            }
+            for (Forwarding<T> f : forwarders.values())
+                consumer.accept(f.subscription);
         }
 
         private final void request1() {
             forAllForwardingSubscriptions(this::request2);
+            requestAdditional();
         }
 
-        final void request2(Subscription s) {
+        void requestAdditional() {}
+
+        final void request2(CancellableSubscription s) {
             if (moreRequested())
                 s.request(1);
         }
@@ -773,37 +866,40 @@ final class R2DBC {
         @Override
         final void cancel0(boolean closeAfterTransaction, Runnable onComplete) {
 
+            // [#20112] Cancel Statement.execute() before it can produce a late Result.
+            executionSubscription.cancel();
+
             // [#12108] Must pass along cancellation to forwarding subscriptions
-            forAllForwardingSubscriptions(Subscription::cancel);
+            forAllForwardingSubscriptions(CancellableSubscription::cancel);
+
+            if (this instanceof TransactionSubscription<?> transaction && !closeAfterTransaction)
+                transaction.cancelTransaction();
 
             // [#12977] Correctly sequence the delegation to run after close completion
-            delegate().connection.updateAndGet(c -> {
-                if (
-                    // close() calls on already closed resources have no effect, so
-                    // the side-effect is OK with the AtomicReference contract
-                    c == null
+            // [#13802] Correctly sequence commit/rollback and then close
+            if (this instanceof TransactionSubscription && !closeAfterTransaction) {
+                onComplete.run();
+                return;
+            }
 
-                    // [#13802] Skip attempting to unnecessarily close NonClosingConnection
-                    || c instanceof NonClosingConnection
+            Connection c = delegate().connection.cancel();
 
-                    // [#13802] Correctly sequence commit/rollback and then close
-                    || this instanceof TransactionSubscription && !closeAfterTransaction
-                ) {
-                    onComplete.run();
-                    return c;
-                }
-                else {
-                    c.close().subscribe(subscriber(
-                        s -> s.request(Long.MAX_VALUE),
-                        t -> {},
-                        t -> {},
-                        onComplete,
-                        configuration.subscriberProvider(),
-                        subscriber
-                    ));
-                    return null;
-                }
-            });
+            if (
+                c == null
+
+                // [#13802] Skip attempting to unnecessarily close NonClosingConnection
+                || c instanceof NonClosingConnection
+            )
+                onComplete.run();
+            else
+                c.close().subscribe(subscriber(
+                    s -> s.request(Long.MAX_VALUE),
+                    t -> {},
+                    t -> {},
+                    onComplete,
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
         }
 
         abstract ConnectionSubscriber<T> delegate();
@@ -875,9 +971,28 @@ final class R2DBC {
     }
 
     static final class TransactionSubscription<T> extends AbstractNonBlockingSubscription<T> {
+        private enum Phase {
+            ACQUIRING,
+            BEGINNING,
+            INITIALISING_BODY,
+            BODY,
+            COMMITTING,
+            ROLLING_BACK,
+            TERMINATED
+        }
+
         final TransactionalPublishable<T> transactional;
         final ConnectionSubscriber<T>     delegate;
         final Set<TransactionProperty>    properties;
+        final CancellableSubscription     bodySubscription;
+        final AtomicInteger               bodyRequestState;
+        final AtomicInteger               bodyRequestWip;
+        volatile boolean                  cancellationRequested;
+        final AtomicReference<Phase>      phase;
+
+        private static final int BODY_REQUEST_IDLE = 0;
+        private static final int BODY_REQUEST_OUTSTANDING = 1;
+        private static final int BODY_REQUEST_UNBOUNDED = 2;
 
         TransactionSubscription(
             DSLContext ctx,
@@ -889,48 +1004,42 @@ final class R2DBC {
 
             this.transactional = transactional;
             this.properties = new LinkedHashSet<>();
+            this.bodySubscription = new CancellableSubscription();
+            this.bodyRequestState = new AtomicInteger(BODY_REQUEST_IDLE);
+            this.bodyRequestWip = new AtomicInteger();
+            this.phase = new AtomicReference<>(Phase.ACQUIRING);
 
             DefaultTransactionContext.init0(new LinkedHashSet<>(asList(properties)), this.properties, new AtomicBoolean());
 
             this.delegate = new ConnectionSubscriber<T>(this) {
                 @Override
                 void onNext0(Connection c) {
-                    c.beginTransaction(transactionDefinition()).subscribe(subscriber(
-                        s -> s.request(1),
-                        v -> {},
-                        subscriber::onError,
+                    if (!phase.compareAndSet(Phase.ACQUIRING, Phase.BEGINNING)) {
+                        finish(null);
+                        return;
+                    }
 
-                        // [#13502] Implement Savepoint logic for nested transactions
-                        () -> {
-                            try {
-                                transactional.run(c instanceof NonClosingConnection
-                                        ? configuration
-                                        : configuration.derive(new DefaultConnectionFactory(configuration, c))).subscribe(subscriber(
-                                    s1 -> s1.request(Long.MAX_VALUE),
-                                    subscriber::onNext,
-                                    e -> rollback(subscriber, c, e),
-                                    () -> c.commitTransaction().subscribe(subscriber(
-                                        s2 -> s2.request(1),
-                                        v -> {},
-                                        t -> cancel0(true, () -> subscriber.onError(t)),
-                                        () -> cancel0(true, () -> subscriber.onComplete()),
-                                        configuration.subscriberProvider(),
-                                        subscriber
-                                    )),
-                                    configuration.subscriberProvider(),
-                                    subscriber
-                                ));
-                            }
+                    // Cancellation may race with delivery of the Connection.
+                    // Do not start a transaction that no downstream still
+                    // owns; close the connection through finish() instead.
+                    if (cancellationRequested) {
+                        finish(null);
+                        return;
+                    }
 
-                            // [#15702] The TransactionalPublishable might throw exceptions
-                            //          while initialising a Publisher
-                            catch (Exception e) {
-                                rollback(subscriber, c, e);
-                            }
-                        },
-                        configuration.subscriberProvider(),
-                        subscriber
-                    ));
+                    try {
+                        c.beginTransaction(transactionDefinition()).subscribe(subscriber(
+                            s -> s.request(1),
+                            v -> {},
+                            TransactionSubscription.this::finish,
+                            () -> beginComplete(c),
+                            configuration.subscriberProvider(),
+                            subscriber
+                        ));
+                    }
+                    catch (Throwable t) {
+                        finish(t);
+                    }
                 }
 
                 private final TransactionDefinition transactionDefinition() {
@@ -960,17 +1069,269 @@ final class R2DBC {
                     };
                 }
 
-                private final void rollback(Subscriber<? super T> s, Connection c, Throwable e) {
-                    c.rollbackTransaction().subscribe(subscriber(
-                        s2 -> s2.request(1),
-                        v -> {},
-                        t -> cancel0(true, () -> s.onError(t)),
-                        () -> cancel0(true, () -> s.onError(e)),
-                        configuration.subscriberProvider(),
-                        s
-                    ));
-                }
             };
+        }
+
+        private final void beginComplete(Connection c) {
+            if (!phase.compareAndSet(Phase.BEGINNING, Phase.INITIALISING_BODY))
+                return;
+
+            if (cancellationRequested) {
+                if (phase.compareAndSet(Phase.INITIALISING_BODY, Phase.ROLLING_BACK))
+                    rollback(c, new CancellationException("Reactive transaction subscription was cancelled"));
+
+                return;
+            }
+
+            Publisher<T> publisher;
+
+            try {
+                // [#13502] Implement Savepoint logic for nested transactions
+                publisher = transactional.run(c instanceof NonClosingConnection
+                    ? configuration
+                    : configuration.derive(new DefaultConnectionFactory(configuration, c)));
+            }
+
+            // [#15702] The TransactionalPublishable might throw exceptions
+            //          while initialising a Publisher
+            catch (Throwable t) {
+                if (phase.compareAndSet(Phase.INITIALISING_BODY, Phase.ROLLING_BACK))
+                    rollback(c, t);
+
+                return;
+            }
+
+            if (cancellationRequested) {
+                if (phase.compareAndSet(Phase.INITIALISING_BODY, Phase.ROLLING_BACK))
+                    rollback(c, new CancellationException("Reactive transaction subscription was cancelled"));
+
+                return;
+            }
+
+            if (!phase.compareAndSet(Phase.INITIALISING_BODY, Phase.BODY))
+                return;
+
+            // Cancellation may land after the initial flag check but before
+            // the body state becomes visible to cancelTransaction(). Recheck
+            // after the transition so this window cannot lose cancellation.
+            if (cancellationRequested && phase.compareAndSet(Phase.BODY, Phase.ROLLING_BACK)) {
+                bodySubscription.cancel();
+                rollback(c, new CancellationException("Reactive transaction subscription was cancelled"));
+                return;
+            }
+
+            try {
+                publisher.subscribe(subscriber(
+                    s -> {
+                        if (bodySubscription.setSubscription(s))
+                            requestBody();
+                    },
+                    value -> {
+                        if (phase.get() == Phase.BODY && !completed.get())
+                            subscriber.onNext(value);
+
+                        if (
+                            bodyRequestState.get() == BODY_REQUEST_OUTSTANDING
+                            && bodyRequestState.compareAndSet(BODY_REQUEST_OUTSTANDING, BODY_REQUEST_IDLE)
+                        )
+                            requestBody();
+                    },
+                    e -> {
+                        if (phase.compareAndSet(Phase.BODY, Phase.ROLLING_BACK))
+                            rollback(c, e);
+                    },
+                    () -> {
+                        if (phase.compareAndSet(Phase.BODY, Phase.COMMITTING))
+                            commit(c);
+                    },
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
+            }
+            catch (Throwable t) {
+                if (phase.compareAndSet(Phase.BODY, Phase.ROLLING_BACK))
+                    rollback(c, t);
+            }
+        }
+
+        private final void commit(Connection c) {
+            try {
+                c.commitTransaction().subscribe(subscriber(
+                    s -> s.request(1),
+                    v -> {},
+                    this::finish,
+                    () -> finish(null),
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
+            }
+            catch (Throwable t) {
+                finish(t);
+            }
+        }
+
+        private final void rollback(Connection c, Throwable cause) {
+            try {
+                c.rollbackTransaction().subscribe(subscriber(
+                    s -> s.request(1),
+                    v -> {},
+                    rollbackError -> {
+                        if (rollbackError != cause)
+                            rollbackError.addSuppressed(cause);
+
+                        finish(rollbackError);
+                    },
+                    () -> finish(cause),
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
+            }
+            catch (Throwable rollbackError) {
+                if (rollbackError != cause)
+                    rollbackError.addSuppressed(cause);
+
+                finish(rollbackError);
+            }
+        }
+
+        private final void finish(Throwable error) {
+            Phase previous = phase.getAndSet(Phase.TERMINATED);
+
+            if (previous == Phase.TERMINATED)
+                return;
+
+            boolean signal = completed.compareAndSet(false, true);
+
+            executionSubscription.cancel();
+            for (Forwarding<T> forwarder : forwarders.values())
+                forwarder.subscription.cancel();
+
+            Connection c = delegate.connection.cancel();
+
+            if (c == null || c instanceof NonClosingConnection) {
+                signalFinish(signal, error);
+                return;
+            }
+
+            FinishOnClose closeComplete = new FinishOnClose(signal, error);
+
+            try {
+                c.close().subscribe(subscriber(
+                    s -> s.request(Long.MAX_VALUE),
+                    v -> {},
+                    closeComplete,
+                    closeComplete,
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
+            }
+            catch (Throwable closeError) {
+                closeComplete.accept(closeError);
+            }
+        }
+
+        private final void signalFinish(boolean signal, Throwable error) {
+            if (signal) {
+                if (error != null)
+                    subscriber.onError(error);
+                else
+                    subscriber.onComplete();
+            }
+            else if (error != null && !(error instanceof CancellationException))
+                log.warn("Error while cleaning up a cancelled reactive transaction", error);
+        }
+
+        private final class FinishOnClose implements Consumer<Throwable>, Runnable {
+            final boolean       signal;
+            final Throwable     error;
+            final AtomicBoolean terminated;
+
+            FinishOnClose(boolean signal, Throwable error) {
+                this.signal = signal;
+                this.error = error;
+                this.terminated = new AtomicBoolean();
+            }
+
+            @Override
+            public final void accept(Throwable closeError) {
+                if (!terminated.compareAndSet(false, true))
+                    return;
+
+                if (closeError != null) {
+                    if (!signal && (error == null || error instanceof CancellationException))
+                        log.warn("Error while closing a cancelled reactive transaction", closeError);
+
+                    if (error != null) {
+                        if (closeError != error)
+                            error.addSuppressed(closeError);
+                    }
+                    else if (signal)
+                        subscriber.onError(closeError);
+
+                    if (error == null)
+                        return;
+                }
+
+                signalFinish(signal, error);
+            }
+
+            @Override
+            public final void run() {
+                accept(null);
+            }
+        }
+
+        private final void cancelTransaction() {
+            cancellationRequested = true;
+
+            if (phase.compareAndSet(Phase.BODY, Phase.ROLLING_BACK)) {
+                bodySubscription.cancel();
+                Connection c = delegate.connection.connection();
+
+                if (c != null)
+                    rollback(c, new CancellationException("Reactive transaction subscription was cancelled"));
+            }
+        }
+
+        private final void requestBody() {
+            if (bodyRequestWip.getAndIncrement() != 0)
+                return;
+
+            int missed = 1;
+
+            for (;;) {
+                Subscription body = bodySubscription.subscription();
+
+                if (
+                    phase.get() == Phase.BODY
+                    && body != null
+                    && bodyRequestState.get() == BODY_REQUEST_IDLE
+                ) {
+                    if (requested.get() == Long.MAX_VALUE) {
+                        if (bodyRequestState.compareAndSet(BODY_REQUEST_IDLE, BODY_REQUEST_UNBOUNDED))
+                            body.request(Long.MAX_VALUE);
+                    }
+                    else if (
+                        requested.get() != 0L
+                        && bodyRequestState.compareAndSet(BODY_REQUEST_IDLE, BODY_REQUEST_OUTSTANDING)
+                    ) {
+                        if (moreRequested())
+                            body.request(1);
+                        else
+                            bodyRequestState.compareAndSet(BODY_REQUEST_OUTSTANDING, BODY_REQUEST_IDLE);
+                    }
+                }
+
+                missed = bodyRequestWip.addAndGet(-missed);
+
+                if (missed == 0)
+                    return;
+            }
+        }
+
+        @Override
+        final void requestAdditional() {
+            requestBody();
         }
 
         @Override
