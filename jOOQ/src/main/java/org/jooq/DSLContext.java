@@ -818,6 +818,28 @@ public interface DSLContext extends Scope {
 
     /**
      * Run a {@link TransactionalPublishable} reactively.
+     * <p>
+     * Values are forwarded while the transaction is still running. Only this
+     * publisher's completion signal indicates that the commit has completed.
+     * Single-item adapters that complete and cancel their source after the first
+     * value must therefore not be used when post-commit visibility is required.
+     * Instead, consume this publisher through an adapter that waits for source
+     * completion. [#20114]
+     * <p>
+     * In particular, Reactor's <code>Mono.from(Publisher)</code> and RxJava's
+     * <code>Maybe.fromPublisher(Publisher)</code> take the first value and cancel
+     * their source. For a completion-aware 0..1 result, use Reactor's
+     * <code>Flux.from(Publisher).singleOrEmpty()</code> or RxJava's
+     * <code>Flowable.fromPublisher(Publisher).singleElement()</code>. RxJava's
+     * <code>Single.fromPublisher(Publisher)</code> also waits for completion, but
+     * requires exactly one value.
+     * <p>
+     * Cancellation before the commit begins prevents further transaction work.
+     * If the transaction body is active, jOOQ cancels it and requests rollback.
+     * Connection acquisition and already-started transaction-control publishers
+     * may still finish, and the R2DBC driver determines their exact command
+     * sequencing. Once the commit has begun, it is allowed to finish before the
+     * connection is released.
      *
      * @param transactional The transactional code
      * @return The transactional outcome
@@ -829,6 +851,28 @@ public interface DSLContext extends Scope {
 
     /**
      * Run a {@link TransactionalPublishable} reactively.
+     * <p>
+     * Values are forwarded while the transaction is still running. Only this
+     * publisher's completion signal indicates that the commit has completed.
+     * Single-item adapters that complete and cancel their source after the first
+     * value must therefore not be used when post-commit visibility is required.
+     * Instead, consume this publisher through an adapter that waits for source
+     * completion. [#20114]
+     * <p>
+     * In particular, Reactor's <code>Mono.from(Publisher)</code> and RxJava's
+     * <code>Maybe.fromPublisher(Publisher)</code> take the first value and cancel
+     * their source. For a completion-aware 0..1 result, use Reactor's
+     * <code>Flux.from(Publisher).singleOrEmpty()</code> or RxJava's
+     * <code>Flowable.fromPublisher(Publisher).singleElement()</code>. RxJava's
+     * <code>Single.fromPublisher(Publisher)</code> also waits for completion, but
+     * requires exactly one value.
+     * <p>
+     * Cancellation before the commit begins prevents further transaction work.
+     * If the transaction body is active, jOOQ cancels it and requests rollback.
+     * Connection acquisition and already-started transaction-control publishers
+     * may still finish, and the R2DBC driver determines their exact command
+     * sequencing. Once the commit has begun, it is allowed to finish before the
+     * connection is released.
      *
      * @param transactional The transactional code
      * @return The transactional outcome
