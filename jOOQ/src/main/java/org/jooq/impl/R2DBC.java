@@ -485,9 +485,19 @@ final class R2DBC {
 
     static abstract class ConnectionSubscriber<T> implements DownstreamSubscriber<Connection> {
 
+        private static final Subscription CANCELLED = new Subscription() {
+            @Override
+            public void request(long n) {}
+
+            @Override
+            public void cancel() {}
+        };
+
         final AbstractNonBlockingSubscription<T> downstream;
         final AtomicReference<Connection>        connection;
         final AtomicReference<Subscription>      subscription;
+        private Thread                          setupThread;
+        private Runnable                        afterSetup;
 
         ConnectionSubscriber(AbstractNonBlockingSubscription<T> downstream) {
             this.downstream = downstream;
@@ -504,14 +514,55 @@ final class R2DBC {
         public final void onSubscribe(Subscription s) {
 
             // [#17094] Stores the Subscription that handles the connection establishment.
-            subscription.set(s);
-            s.request(1);
+            //          A cancellation that arrived before this subscription cancels it.
+            if (subscription.compareAndSet(null, s))
+                s.request(1);
+            else
+                s.cancel();
         }
 
+        // Another thread's cancellation defers cleanup until setup returns, without holding a lock across callbacks.
         @Override
         public final void onNext(Connection c) {
-            connection.set(c);
-            onNext0(c);
+
+            // Never cancel a delivered connection's acquisition: r2dbc-pool releases the connection of an
+            // acquisition cancelled before it completes, while the connection is still in use here.
+            subscription.set(CANCELLED);
+
+            synchronized (this) {
+                setupThread = Thread.currentThread();
+                connection.set(c);
+            }
+
+            try {
+                // A connection that arrives after cancellation is closed instead of used,
+                // unless the concurrent cancellation already took it over for closing.
+                if (downstream.completed.get()) {
+                    if (connection.compareAndSet(c, null))
+                        c.close().subscribe(subscriber(
+                            s -> s.request(Long.MAX_VALUE),
+                            t -> {},
+                            t -> {},
+                            () -> {},
+                            downstream.configuration.subscriberProvider(),
+                            downstream.subscriber
+                        ));
+                }
+                else
+                    onNext0(c);
+            }
+            finally {
+                Runnable completion;
+
+                synchronized (this) {
+                    setupThread = null;
+                    completion = afterSetup;
+                    afterSetup = null;
+                }
+
+                if (completion != null)
+                    completion.run();
+            }
         }
 
         abstract void onNext0(Connection c);
@@ -525,12 +576,10 @@ final class R2DBC {
         public final void onComplete() {}
 
         final void cancelSubscription() {
-            subscription.updateAndGet(s -> {
-                if (s != null)
-                    s.cancel();
+            Subscription s = subscription.getAndSet(CANCELLED);
 
-                return null;
-            });
+            if (s != null)
+                s.cancel();
         }
     }
 
@@ -786,33 +835,53 @@ final class R2DBC {
             forAllForwardingSubscriptions(Subscription::cancel);
 
             // [#12977] Correctly sequence the delegation to run after close completion
-            delegate().connection.updateAndGet(c -> {
-                if (
-                    // close() calls on already closed resources have no effect, so
-                    // the side-effect is OK with the AtomicReference contract
-                    c == null
+            //          The update function may be retried when a connection arrives
+            //          concurrently, so it only decides, and the side effects run once.
+            Connection c;
+            ConnectionSubscriber<T> delegate = delegate();
 
-                    // [#13802] Skip attempting to unnecessarily close NonClosingConnection
-                    || c instanceof NonClosingConnection
+            synchronized (delegate) {
+                // A cancellation on the setup thread itself is reentrant and proceeds as upstream
+                if (delegate.setupThread != null && delegate.setupThread != Thread.currentThread()) {
+                    Runnable previous = delegate.afterSetup;
+                    delegate.afterSetup = () -> {
+                        try {
+                            if (previous != null)
+                                previous.run();
+                        }
+                        finally {
+                            cancel0(closeAfterTransaction, onComplete);
+                        }
+                    };
+                    return;
+                }
 
-                    // [#13802] Correctly sequence commit/rollback and then close
-                    || this instanceof TransactionSubscription && !closeAfterTransaction
-                ) {
-                    onComplete.run();
-                    return c;
-                }
-                else {
-                    c.close().subscribe(subscriber(
-                        s -> s.request(Long.MAX_VALUE),
-                        t -> {},
-                        t -> {},
-                        onComplete,
-                        configuration.subscriberProvider(),
-                        subscriber
-                    ));
-                    return null;
-                }
-            });
+                c = delegate.connection.getAndUpdate(x -> keepConnection(x, closeAfterTransaction) ? x : null);
+            }
+
+            if (keepConnection(c, closeAfterTransaction)) {
+                onComplete.run();
+            }
+            else {
+                c.close().subscribe(subscriber(
+                    s -> s.request(Long.MAX_VALUE),
+                    t -> {},
+                    t -> {},
+                    onComplete,
+                    configuration.subscriberProvider(),
+                    subscriber
+                ));
+            }
+        }
+
+        private final boolean keepConnection(Connection c, boolean closeAfterTransaction) {
+            return c == null
+
+                // [#13802] Skip attempting to unnecessarily close NonClosingConnection
+                || c instanceof NonClosingConnection
+
+                // [#13802] Correctly sequence commit/rollback and then close
+                || this instanceof TransactionSubscription && !closeAfterTransaction;
         }
 
         abstract ConnectionSubscriber<T> delegate();
