@@ -976,7 +976,7 @@ final class R2DBC {
                     c.beginTransaction(transactionDefinition()).subscribe(subscriber(
                         s -> s.request(1),
                         v -> {},
-                        subscriber::onError,
+                        t -> cancel0(true, () -> subscriber.onError(t)),
 
                         // [#13502] Implement Savepoint logic for nested transactions
                         () -> {
